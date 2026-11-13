@@ -1,76 +1,145 @@
-name: 170BOOKS — Build APK and publish Release
+
+name: 170BOOKS - ZIP to APK
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: 170books-release-${{ github.ref }}
+  group: 170books-build
   cancel-in-progress: false
 
 jobs:
-  build-and-release:
-    name: Build Android APK and publish GitHub Release
+  build:
+    name: Extract ZIP and build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Download repository files
+        uses: actions/checkout@v4
+
+      - name: Find and extract ZIP
+        shell: bash
+        run: |
+          set -e
+
+          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::ZIP archive not found in repository root!"
+            exit 1
+          fi
+
+          echo "Found archive: $ZIP_FILE"
+
+          mkdir -p "$RUNNER_TEMP/170books-unpacked"
+
+          python3 - "$ZIP_FILE" "$RUNNER_TEMP/170books-unpacked" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2]).resolve()
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  target = (destination / item.filename).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit("Unsafe path in ZIP archive")
+              z.extractall(destination)
+
+          print("ZIP successfully extracted!")
+          PY
+
+      - name: Find Android project
+        shell: bash
+        run: |
+          set -e
+
+          ROOT="$RUNNER_TEMP/170books-unpacked"
+
+          PROJECT=$(find "$ROOT" -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -printf '%h\n' | head -n 1)
+
+          if [ -z "$PROJECT" ]; then
+            echo "::error::settings.gradle or settings.gradle.kts not found!"
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT/app/build.gradle" ] && \
+             [ ! -f "$PROJECT/app/build.gradle.kts" ]; then
+            echo "::error::Android app module not found!"
+            exit 1
+          fi
+
+          echo "Android project found: $PROJECT"
+
+          cp -a "$PROJECT/." "$GITHUB_WORKSPACE/"
+
+          echo "Project files:"
+          ls -la
 
       - name: Set up Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # This project does not include gradlew, so install the pinned Gradle version.
-      - name: Set up Gradle 8.7
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: '8.7'
-          cache-provider: basic
-
-      - name: Check Android project files
+      - name: Build APK
+        shell: bash
         run: |
-          test -f settings.gradle.kts
-          test -f build.gradle.kts
-          test -f app/build.gradle.kts
-          test -f app/src/main/AndroidManifest.xml
+          set -e
 
-      - name: Build installable release APK
-        run: gradle --no-daemon --stacktrace assembleRelease
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace :app:assembleRelease
+          else
+            curl -fL https://services.gradle.org/distributions/gradle-8.7-bin.zip \
+              -o "$RUNNER_TEMP/gradle.zip"
+            unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+            "$RUNNER_TEMP/gradle-8.7/bin/gradle" \
+              --no-daemon --stacktrace :app:assembleRelease
+          fi
 
-      - name: Verify APK was created
+      - name: Find and prepare APK
+        shell: bash
         run: |
-          APK="app/build/outputs/apk/release/app-release.apk"
-          test -s "$APK"
+          set -e
+
+          APK=$(find app/build/outputs/apk/release \
+            -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK was not created!"
+            exit 1
+          fi
+
           mkdir -p release
-          cp "$APK" "release/170BOOKS-${{ github.run_number }}.apk"
-          ls -lh release/
+          cp "$APK" release/170BOOKS.apk
 
-      - name: Upload APK as workflow artifact
+          ls -lh release/170BOOKS.apk
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: 170BOOKS-APK-${{ github.run_number }}
-          path: release/*.apk
+          name: 170BOOKS-APK
+          path: release/170BOOKS.apk
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish GitHub Release with APK
-        uses: softprops/action-gh-release@v3
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: 170BOOKS v1.0.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
           make_latest: true
-          fail_on_unmatched_files: true
-          files: release/*.apk
+          files: release/170BOOKS.apk
           
